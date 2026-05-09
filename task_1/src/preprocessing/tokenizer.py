@@ -8,23 +8,10 @@ from piano_roll import midi_to_piano_roll, segment_piano_roll
 from sklearn.model_selection import train_test_split
 
 def preprocess_dataset(raw_midi_dir, output_dir, segment_len=256, fs=16, max_files=500):
-    """
-    Full pipeline:
-    1. Finds all MIDI files
-    2. Converts each to piano roll
-    3. Segments into fixed windows
-    4. Saves train/test splits
-
-    Args:
-        raw_midi_dir : folder containing raw MIDI files
-        output_dir   : folder to save processed data
-        segment_len  : time steps per segment
-        fs           : time resolution
-        max_files    : limit files for faster testing (set None for full dataset)
-    """
+    
     midi_files = get_midi_files(raw_midi_dir)
 
-    # Limit files if needed (useful during development)
+    
     if max_files:
         midi_files = midi_files[:max_files]
         print(f"Using {len(midi_files)} files for preprocessing")

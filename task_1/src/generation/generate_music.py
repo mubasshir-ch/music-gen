@@ -1,14 +1,3 @@
-# generate_music.py
-# Generates long-form music via latent space walking between real MIDI sequences.
-#
-# Key fixes over original:
-#   - Adaptive thresholding per chunk (avoids blanket silence or blanket noise)
-#   - Minimum note duration enforcement (kills the single-step "teng" artefact)
-#   - Crossfade overlap between chunks (smooth stitching, no hard cuts)
-#   - Polyphony cap (prevents the chord-cluster noise wall)
-#   - More waypoints + more interpolation steps → longer, more musical output
-#   - Temperature-scaled sampling instead of hard threshold for variety
-
 import os
 import sys
 import numpy as np
@@ -18,272 +7,233 @@ import pretty_midi
 sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
 from models.autoencoder import LSTMAutoencoder
 
-# ─────────────────────────────────────────────
-# Configuration
-# ─────────────────────────────────────────────
 BASE_DIR   = r"D:\neural network\music-generation-unsupervised"
 MODEL_PATH = os.path.join(BASE_DIR, "outputs", "models", "task1_autoencoder_best.pth")
 TEST_DATA  = os.path.join(BASE_DIR, "data", "processed", "test.npy")
 OUTPUT_DIR = os.path.join(BASE_DIR, "outputs", "generated_midis", "task1")
-
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
-LATENT_DIM   = 128
-HIDDEN_SIZE  = 256
-NUM_LAYERS   = 2
-SEQUENCE_LEN = 64
-INPUT_SIZE   = 128
+LATENT_DIM     = 128
+HIDDEN_SIZE    = 256
+NUM_LAYERS     = 2
+SEQUENCE_LEN   = 64
+INPUT_SIZE     = 128
 
-TEMPO        = 100       # BPM — slightly slower sounds more musical
-FS           = 16        # time steps per second
-MIN_NOTE_LEN = 2         # minimum note duration in time steps (kills "teng")
-MAX_POLYPHONY = 6        # max simultaneous notes (prevents noise wall)
-CROSSFADE_LEN = 8        # overlap time steps for smooth chunk joins
+TEMPO          = 115
+FS             = 16
+TARGET_DENSITY = 0.04   # raised: more notes, fewer silences
+MIN_NOTE_STEPS = 4      # raised: min 0.25 s — eliminates micro-clicks
+MAX_POLYPHONY  = 8      # raised: richer chords
+CROSSFADE_LEN  = 20     # longer blend window
+PITCH_MIN      = 48
+PITCH_MAX      = 83
 
 
 def load_model(device):
     model = LSTMAutoencoder(
-        input_size=INPUT_SIZE, hidden_size=HIDDEN_SIZE,
-        latent_dim=LATENT_DIM, sequence_len=SEQUENCE_LEN, num_layers=NUM_LAYERS
+        input_size=INPUT_SIZE,
+        hidden_size=HIDDEN_SIZE,
+        latent_dim=LATENT_DIM,
+        sequence_len=SEQUENCE_LEN,
+        num_layers=NUM_LAYERS,
     ).to(device)
-
-    state = torch.load(MODEL_PATH, map_location=device, weights_only=True)
-    model.load_state_dict(state)
+    model.load_state_dict(
+        torch.load(MODEL_PATH, map_location=device, weights_only=True))
     model.eval()
     print(f"Model loaded from: {MODEL_PATH}")
     return model
 
 
-# ─────────────────────────────────────────────
-# Piano Roll Post-Processing
-# ─────────────────────────────────────────────
-def adaptive_threshold(piano_roll, target_density=0.05):
-    """
-    Instead of a fixed threshold, find one that keeps roughly `target_density`
-    fraction of cells active.  Avoids the all-silence / all-noise extremes.
-    target_density = 0.05 means ~5 % of cells are notes (realistic for piano).
-    """
-    flat = piano_roll.flatten()
-    threshold = np.percentile(flat, (1.0 - target_density) * 100)
-    # Clamp to a reasonable range regardless
-    threshold = float(np.clip(threshold, 0.25, 0.75))
-    return threshold
+def adaptive_threshold(raw_roll, target_density=TARGET_DENSITY):
+    percentile = (1.0 - target_density) * 100
+    threshold  = float(np.percentile(raw_roll.flatten(), percentile))
+    return float(np.clip(threshold, 0.05, 0.85))
 
 
-def enforce_min_note_length(binary_roll, min_len=2):
-    """
-    Remove notes shorter than min_len time steps.
-    This is the main fix for the "teng" (single-step impulse) artefact.
-    """
-    clean = binary_roll.copy()
-    T, P  = clean.shape
-    for pitch in range(P):
-        t = 0
-        while t < T:
-            if clean[t, pitch]:
-                run_start = t
-                while t < T and clean[t, pitch]:
-                    t += 1
-                run_len = t - run_start
-                if run_len < min_len:
-                    clean[run_start:t, pitch] = 0
-            else:
-                t += 1
-    return clean
+def apply_pitch_range(roll):
+    out = roll.copy()
+    out[:, :PITCH_MIN]     = 0
+    out[:, PITCH_MAX + 1:] = 0
+    return out
 
 
-def cap_polyphony(binary_roll, max_voices=6):
-    """
-    At each time step keep only the top-`max_voices` active pitches by
-    activation strength.  Prevents dense chord clusters that sound like noise.
-    """
-    # We need the raw float roll for ranking — binary_roll is already binarised,
-    # so we just randomly drop excess voices when more than max_voices are active.
-    capped = binary_roll.copy()
-    for t in range(capped.shape[0]):
-        active = np.where(capped[t] > 0)[0]
+def remove_short_notes(binary_roll, min_steps=MIN_NOTE_STEPS):
+    out = binary_roll.copy().astype(np.int8)
+    for p in range(out.shape[1]):
+        col    = out[:, p]
+        padded = np.concatenate([[0], col, [0]])
+        diff   = np.diff(padded.astype(np.int8))
+        starts = np.where(diff == 1)[0]
+        ends   = np.where(diff == -1)[0]
+        for s, e in zip(starts, ends):
+            if (e - s) < min_steps:
+                out[s:e, p] = 0
+    return out
+
+
+def cap_polyphony(binary_roll, raw_roll, max_voices=MAX_POLYPHONY):
+    out = binary_roll.copy()
+    for t in range(out.shape[0]):
+        active = np.where(out[t] > 0)[0]
         if len(active) > max_voices:
-            # Keep a musically balanced subset: favour mid-range pitches
-            excess = np.random.choice(active, len(active) - max_voices, replace=False)
-            capped[t, excess] = 0
-    return capped
+            strengths = raw_roll[t, active]
+            keep      = np.argsort(strengths)[-max_voices:]
+            drop_mask = np.ones(len(active), dtype=bool)
+            drop_mask[keep] = False
+            out[t, active[drop_mask]] = 0
+    return out
 
 
-def postprocess(piano_roll, target_density=0.05):
-    """Full post-processing pipeline for a raw sigmoid piano roll."""
-    threshold   = adaptive_threshold(piano_roll, target_density)
-    binary      = (piano_roll > threshold).astype(np.int8)
-    binary      = enforce_min_note_length(binary, min_len=MIN_NOTE_LEN)
-    binary      = cap_polyphony(binary, max_voices=MAX_POLYPHONY)
+def sustain_into_gaps(binary_roll, max_gap_steps=4):
+    """
+    Instead of inserting fake bridge notes, hold (sustain) the last active
+    notes across short silent gaps. This sounds far more natural — the note
+    simply rings a little longer rather than restarting mid-silence.
+    Only gaps <= max_gap_steps (0.25 s at FS=16) are bridged this way.
+    """
+    out = binary_roll.copy()
+    T   = out.shape[0]
+    t   = 0
+    while t < T:
+        if out[t].sum() == 0:
+            gap_start = t
+            while t < T and out[t].sum() == 0:
+                t += 1
+            gap_end = t
+            gap_len = gap_end - gap_start
+            if gap_len <= max_gap_steps and gap_start > 0:
+                # Sustain whichever pitches were playing just before the gap
+                held = np.where(out[gap_start - 1] > 0)[0]
+                for step in range(gap_start, gap_end):
+                    out[step, held] = 1
+        else:
+            t += 1
+    return out
+
+
+def postprocess(raw_roll):
+    thr    = adaptive_threshold(raw_roll)
+    binary = (raw_roll > thr).astype(np.int8)
+    binary = apply_pitch_range(binary)
+    binary = remove_short_notes(binary, MIN_NOTE_STEPS)
+    binary = cap_polyphony(binary, raw_roll, MAX_POLYPHONY)
+    binary = sustain_into_gaps(binary, max_gap_steps=4)
     return binary
 
 
-# ─────────────────────────────────────────────
-# Chunk Stitching with Crossfade
-# ─────────────────────────────────────────────
-def crossfade_concat(chunks, fade_len=8):
-    """
-    Concatenate piano roll chunks with a linear crossfade overlap so there
-    are no hard cut artefacts between segments.
-    chunks: list of (T, 128) float arrays  (raw sigmoid, not yet thresholded)
-    """
-    if len(chunks) == 1:
-        return chunks[0]
-
+def crossfade_concat(chunks, fade_len=CROSSFADE_LEN):
     result = chunks[0]
-    for next_chunk in chunks[1:]:
-        # Fade out tail of current, fade in head of next, sum
-        overlap_len = min(fade_len, result.shape[0], next_chunk.shape[0])
-        fade_out = np.linspace(1.0, 0.0, overlap_len)[:, None]
-        fade_in  = np.linspace(0.0, 1.0, overlap_len)[:, None]
-
-        blended  = result[-overlap_len:] * fade_out + next_chunk[:overlap_len] * fade_in
-
-        result = np.concatenate([
-            result[:-overlap_len],
-            blended,
-            next_chunk[overlap_len:]
-        ], axis=0)
-
+    for nxt in chunks[1:]:
+        olen     = min(fade_len, result.shape[0], nxt.shape[0])
+        fade_out = np.linspace(1.0, 0.0, olen)[:, None]
+        fade_in  = np.linspace(0.0, 1.0, olen)[:, None]
+        blend    = result[-olen:] * fade_out + nxt[:olen] * fade_in
+        result   = np.concatenate([result[:-olen], blend, nxt[olen:]], axis=0)
     return result
 
 
-# ─────────────────────────────────────────────
-# Piano Roll → MIDI
-# ─────────────────────────────────────────────
-def piano_roll_to_midi(binary_roll, tempo=100, fs=16):
-    """
-    Converts a *binary* (already thresholded + post-processed) piano roll
-    to a PrettyMIDI object.
-    """
+def binary_to_midi(binary_roll, tempo=TEMPO, fs=FS):
     midi  = pretty_midi.PrettyMIDI(initial_tempo=tempo)
-    piano = pretty_midi.Instrument(program=0)  # Acoustic Grand Piano
-    time_per_step = 1.0 / fs
+    piano = pretty_midi.Instrument(program=0)
+    spb   = 1.0 / fs
 
-    for pitch in range(128):
+    for pitch in range(PITCH_MIN, PITCH_MAX + 1):
         note_on = None
         for t in range(binary_roll.shape[0]):
             if binary_roll[t, pitch] and note_on is None:
                 note_on = t
             elif not binary_roll[t, pitch] and note_on is not None:
-                start = note_on * time_per_step
-                end   = t * time_per_step
-                # Velocity: slightly randomise for a more human feel
-                vel = int(np.random.randint(65, 95))
-                piano.notes.append(pretty_midi.Note(velocity=vel, pitch=pitch,
-                                                    start=start, end=end))
+                start = note_on * spb
+                end   = t * spb
+                norm  = (pitch - PITCH_MIN) / (PITCH_MAX - PITCH_MIN)
+                vel   = int(np.clip(58 + norm * 22 + np.random.randint(-4, 5), 50, 90))
+                piano.notes.append(
+                    pretty_midi.Note(velocity=vel, pitch=pitch, start=start, end=end))
                 note_on = None
-        # Close any still-open note at end
         if note_on is not None:
-            start = note_on * time_per_step
-            end   = binary_roll.shape[0] * time_per_step
-            piano.notes.append(pretty_midi.Note(velocity=80, pitch=pitch,
-                                                start=start, end=end))
+            piano.notes.append(
+                pretty_midi.Note(velocity=70, pitch=pitch,
+                                 start=note_on * spb,
+                                 end=binary_roll.shape[0] * spb))
 
     midi.instruments.append(piano)
     return midi
 
 
-# ─────────────────────────────────────────────
-# Latent Walk Generation
-# ─────────────────────────────────────────────
-def generate_long_music(model, device,
-                         num_waypoints=8,
-                         steps_between=10,
-                         target_duration_sec=90):
-    """
-    Walks through `num_waypoints` real songs in latent space, interpolating
-    `steps_between` decoded chunks between each pair of waypoints.
-
-    With SEQUENCE_LEN=64 and FS=16:
-      - each chunk = 64/16 = 4 seconds
-      - steps_between=10 → ~40 s per pair of waypoints
-      - num_waypoints=8  → 7 gaps → ~280 s before capping
-
-    We cap at target_duration_sec to keep file sizes manageable.
-    """
-    print(f"Loading test data from: {TEST_DATA}")
-    data   = np.load(TEST_DATA)                   # (N, 128, 64)
-    data   = np.transpose(data, (0, 2, 1))        # (N, 64, 128)
+def generate_track(model, device, num_waypoints=8, steps_between=14, target_sec=90):
+    data   = np.transpose(np.load(TEST_DATA), (0, 2, 1))
     tensor = torch.FloatTensor(data).to(device)
 
-    max_chunks = int(np.ceil(target_duration_sec * FS / SEQUENCE_LEN))
+    max_chunks   = int(np.ceil(target_sec * FS / SEQUENCE_LEN))
+    active_counts = tensor.sum(dim=(1, 2)).cpu().numpy()
+    valid_indices = np.where(active_counts > 15)[0]
+    if len(valid_indices) < num_waypoints:
+        valid_indices = np.arange(len(tensor))
 
     with torch.no_grad():
-        indices    = np.random.choice(len(tensor), num_waypoints, replace=False)
-        waypoints  = tensor[indices]
-        z_waypoints = model.encoder(waypoints)    # (num_waypoints, latent_dim)
+        idx         = np.random.choice(valid_indices, num_waypoints, replace=False)
+        waypoints   = tensor[idx]
+        z_waypoints = model.encoder(waypoints)
 
         raw_chunks = []
-
         for i in range(num_waypoints - 1):
             if len(raw_chunks) >= max_chunks:
                 break
-
-            z_start = z_waypoints[i]
-            z_end   = z_waypoints[i + 1]
-
-            # Smooth interpolation (include start, exclude end to avoid doubling)
+            z0     = z_waypoints[i]
+            z1     = z_waypoints[i + 1]
             alphas = np.linspace(0, 1, steps_between + 1)[:-1]
-
             for alpha in alphas:
                 if len(raw_chunks) >= max_chunks:
                     break
-                z_mix  = ((1.0 - alpha) * z_start + alpha * z_end).unsqueeze(0)
-                # No teacher forcing at inference — model generates freely
-                chunk  = model.decoder(z_mix, target=None, teacher_forcing_ratio=0.0)
-                chunk  = chunk.squeeze(0).cpu().numpy()   # (64, 128)
-                raw_chunks.append(chunk)
+                z_mix = ((1.0 - alpha) * z0 + alpha * z1).unsqueeze(0)
+                chunk = model.decoder(z_mix, target=None, teacher_forcing_ratio=0.0)
+                raw_chunks.append(chunk.squeeze(0).cpu().numpy())
 
-        # Always include the final waypoint
         if len(raw_chunks) < max_chunks:
-            final = model.decoder(
-                z_waypoints[-1].unsqueeze(0), target=None, teacher_forcing_ratio=0.0
-            ).squeeze(0).cpu().numpy()
-            raw_chunks.append(final)
+            last = model.decoder(z_waypoints[-1].unsqueeze(0),
+                                 target=None, teacher_forcing_ratio=0.0)
+            raw_chunks.append(last.squeeze(0).cpu().numpy())
 
-    print(f"Generated {len(raw_chunks)} raw chunks ({len(raw_chunks)*SEQUENCE_LEN/FS:.1f}s raw)")
+    print(f"  Decoded {len(raw_chunks)} chunks "
+          f"({len(raw_chunks) * SEQUENCE_LEN / FS:.1f} s raw)")
 
-    # Stitch with crossfade (on raw float values, before thresholding)
-    long_roll_raw = crossfade_concat(raw_chunks, fade_len=CROSSFADE_LEN)
+    stitched = crossfade_concat(raw_chunks, CROSSFADE_LEN)
+    binary   = postprocess(stitched)
 
-    # Post-process: threshold + min note length + polyphony cap
-    long_roll = postprocess(long_roll_raw, target_density=0.05)
+    if binary.sum() == 0:
+        print("  Warning: empty output — retrying at higher density")
+        thr    = float(np.percentile(stitched.flatten(), 96.0))
+        binary = (stitched > thr).astype(np.int8)
+        binary = apply_pitch_range(binary)
+        binary = remove_short_notes(binary, 2)
+        binary = cap_polyphony(binary, stitched, MAX_POLYPHONY)
+        binary = sustain_into_gaps(binary, max_gap_steps=4)
 
-    return long_roll
+    return binary
 
 
-# ─────────────────────────────────────────────
-# Main
-# ─────────────────────────────────────────────
 if __name__ == "__main__":
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"Using device: {device}\n")
+    print(f"Device: {device}\n")
 
     model = load_model(device)
+    print("\nGenerating 5 MIDI compositions (~90 s each)...\n")
 
-    num_tracks = 5
-    print(f"Generating {num_tracks} long-form MIDI tracks (~90 seconds each)...\n")
+    for i in range(1, 6):
+        print(f"Track {i}:")
+        binary   = generate_track(model, device,
+                                  num_waypoints=8,
+                                  steps_between=14,
+                                  target_sec=90)
+        midi_obj = binary_to_midi(binary)
+        path     = os.path.join(OUTPUT_DIR, f"task1_long_morph_{i}.mid")
+        midi_obj.write(path)
 
-    for i in range(1, num_tracks + 1):
-        long_roll = generate_long_music(
-            model, device,
-            num_waypoints=8,        # morph through 8 real songs
-            steps_between=10,       # 10 decoded chunks between each waypoint
-            target_duration_sec=90  # cap at 90 seconds
-        )
+        notes = midi_obj.instruments[0].notes
+        dur   = midi_obj.get_end_time()
+        durs  = [n.end - n.start for n in notes]
+        print(f"  {dur:.1f}s | {len(notes)} notes | "
+              f"{len(notes)/dur:.2f} notes/s | avg_dur: {np.mean(durs):.2f}s")
+        print(f"  Saved → {path}\n")
 
-        binary_roll = long_roll   # already binarised inside generate_long_music
-        midi_obj    = piano_roll_to_midi(binary_roll, tempo=TEMPO, fs=FS)
-        note_count  = sum(len(inst.notes) for inst in midi_obj.instruments)
-
-        total_steps = binary_roll.shape[0]
-        seconds     = total_steps / FS
-
-        save_path = os.path.join(OUTPUT_DIR, f"task1_long_morph_{i}.mid")
-        midi_obj.write(save_path)
-
-        print(f"Track {i}: {total_steps} steps | {seconds:.1f}s | "
-              f"{note_count} notes | → {save_path}")
-
-    print("\nDone!")
+    print("All tracks generated.")

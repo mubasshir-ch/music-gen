@@ -4,13 +4,6 @@
 import os
 
 def get_midi_files(root_dir):
-    """
-    Recursively finds all .mid and .midi files in the given directory.
-    Args:
-        root_dir: path to raw_midi folder
-    Returns:
-        list of full file paths
-    """
     midi_files = []
 
     for dirpath, dirnames, filenames in os.walk(root_dir):
