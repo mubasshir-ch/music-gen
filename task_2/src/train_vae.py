@@ -25,7 +25,7 @@ CHECKPOINT_DIR.mkdir(parents=True, exist_ok=True)
 PLOT_DIR.mkdir(parents=True, exist_ok=True)
 
 BATCH_SIZE = 64         # adjust this based on your GPU memory and training speed requirements
-TOTAL_EPOCHS = 52       # adjust this based on how long you want to train and how the losses are progressing
+TOTAL_EPOCHS = 54       # adjust this based on how long you want to train and how the losses are progressing
 LR = 1e-3               # reduce this if the training is unstable or the losses are not decreasing
 
 INPUT_DIM = 88          # number of piano keys (MIDI pitches 21 to 108)
