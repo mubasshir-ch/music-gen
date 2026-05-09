@@ -2,6 +2,8 @@ import numpy as np
 import torch
 from torch.utils.data import Dataset
 
+# this file defines the PianoRollDataset class, 
+# which is a PyTorch Dataset that loads piano roll data from .npy files.
 
 class PianoRollDataset(Dataset):
     def __init__(self, npy_path):

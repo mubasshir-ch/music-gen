@@ -10,9 +10,7 @@ from dataset import PianoRollDataset
 from vae_model import LSTMVAE
 
 
-# =====================
-# Config
-# =====================
+# ============== Config ===============
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
@@ -26,28 +24,26 @@ PLOT_DIR = OUTPUT_DIR / "plots"
 CHECKPOINT_DIR.mkdir(parents=True, exist_ok=True)
 PLOT_DIR.mkdir(parents=True, exist_ok=True)
 
-BATCH_SIZE = 64
-TOTAL_EPOCHS = 50
-LR = 1e-3
+BATCH_SIZE = 64         # adjust this based on your GPU memory and training speed requirements
+TOTAL_EPOCHS = 52       # adjust this based on how long you want to train and how the losses are progressing
+LR = 1e-3               # reduce this if the training is unstable or the losses are not decreasing
 
-INPUT_DIM = 88
-HIDDEN_DIM = 128
-LATENT_DIM = 64
-NUM_LAYERS = 2
-SEQ_LEN = 128
+INPUT_DIM = 88          # number of piano keys (MIDI pitches 21 to 108)
+HIDDEN_DIM = 128        # size of LSTM hidden layers
+LATENT_DIM = 64         # size of the latent vector (bottleneck)
+NUM_LAYERS = 2          # number of LSTM layers in the encoder and decoder
+SEQ_LEN = 128           # length of the input piano roll windows (must match the window size used in preprocessing)
 
-KL_WARMUP_EPOCHS = 30
-MAX_BETA = 0.01
+KL_WARMUP_EPOCHS = 30   # KL-Annealing: number of epochs to warm up the KL divergence weight (beta) from 0 to MAX_BETA
+MAX_BETA = 0.01         # KL-Annealing: maximum weight for the KL divergence term in the VAE loss (try values between 0.01 and 0.1 to start with)
 
-RESUME = True
+RESUME = True 
 RESUME_PATH = CHECKPOINT_DIR / "latest_lstm_vae.pt"
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
 
-# =====================
 # Pos weight helper
-# =====================
 
 def estimate_pos_weight(dataset, max_batches=100, batch_size=64):
     loader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
@@ -69,43 +65,24 @@ def estimate_pos_weight(dataset, max_batches=100, batch_size=64):
     return pos_weight
 
 
-# =====================
 # Loss functions
-# =====================
-
+# KL(q(z|x) || N(0, I))
 def kl_divergence(mu, logvar):
-    """
-    KL(q(z|x) || N(0, I))
-    Returns average KL per batch.
-    """
     kl = -0.5 * torch.sum(1 + logvar - mu.pow(2) - logvar.exp(), dim=1)
     return kl.mean()
 
-
-# def get_beta(epoch):
-#     """
-#     KL annealing:
-#     beta starts near 0 and increases to 1.
-#     """
-#     return min(MAX_BETA, epoch / KL_WARMUP_EPOCHS)
-
+# KL-annealing part
 def get_beta(epoch):
     return min(MAX_BETA, MAX_BETA * epoch / KL_WARMUP_EPOCHS)
-
 
 def vae_loss(logits, x, mu, logvar, recon_criterion, beta):
     recon_loss = recon_criterion(logits, x)
     kl_loss = kl_divergence(mu, logvar)
 
-    total_loss = recon_loss + beta * kl_loss
-
+    total_loss = recon_loss + beta * kl_loss   # # VAE loss = reconstruction loss + beta * KL divergence
     return total_loss, recon_loss, kl_loss
 
-
-# =====================
 # Train / validate
-# =====================
-
 def train_one_epoch(model, loader, recon_criterion, optimizer, beta):
     model.train()
 
@@ -116,9 +93,9 @@ def train_one_epoch(model, loader, recon_criterion, optimizer, beta):
     for x in tqdm(loader, desc="Training", leave=False):
         x = x.to(DEVICE)
 
-        optimizer.zero_grad()
+        optimizer.zero_grad()                           # zero the gradients before the backward pass
 
-        logits, mu, logvar = model(x)
+        logits, mu, logvar = model(x)                   # forward pass through the VAE model to get the output logits and the latent distribution parameters (mu and logvar)    
 
         loss, recon_loss, kl_loss = vae_loss(
             logits,
@@ -129,14 +106,15 @@ def train_one_epoch(model, loader, recon_criterion, optimizer, beta):
             beta,
         )
 
-        loss.backward()
+        loss.backward()                                 # compute the gradients of the loss with respect to the model parameters
 
-        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)    # gradient clipping to prevent exploding gradients (clip the norm of the gradients to a maximum value)
 
-        optimizer.step()
+        optimizer.step()                                # update the model parameters using the computed gradients and the optimization algorithm (Adam in this case)
 
-        batch_size = x.size(0)
+        batch_size = x.size(0)                          # get the actual batch size (last batch may be smaller)
 
+        # accumulate the total loss, reconstruction loss, and KL loss for this batch, weighted by the batch size, to compute the average losses later
         total_loss_sum += loss.item() * batch_size
         recon_loss_sum += recon_loss.item() * batch_size
         kl_loss_sum += kl_loss.item() * batch_size
@@ -149,6 +127,8 @@ def train_one_epoch(model, loader, recon_criterion, optimizer, beta):
         kl_loss_sum / n,
     )
 
+# The validate function is similar to train_one_epoch but runs in evaluation mode (model.eval()) and does not compute gradients or update the model parameters. 
+# It also uses torch.no_grad() to disable gradient tracking for efficiency. It computes and returns the average total loss, reconstruction loss, and KL loss on the validation set.
 
 def validate(model, loader, recon_criterion, beta):
     model.eval()
@@ -187,9 +167,7 @@ def validate(model, loader, recon_criterion, beta):
     )
 
 
-# =====================
-# Save / plot
-# =====================
+# Checkpointing and plotting
 
 def save_checkpoint(
     path,
@@ -256,9 +234,11 @@ def plot_history(history):
     plt.close()
 
 
-# =====================
-# Main
-# =====================
+# The main function orchestrates the entire training process: 
+# it loads the datasets, 
+# initializes the model and optimizer, 
+# optionally resumes from a checkpoint, 
+# and runs the training loop for the specified number of epochs.
 
 def main():
     print("Using device:", DEVICE)
@@ -288,6 +268,7 @@ def main():
     pos_weight = torch.tensor(pos_weight_value, device=DEVICE)
     recon_criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
 
+    # initialize the LSTM VAE model with the specified architecture and move it to the configured device (CPU or GPU).
     model = LSTMVAE(
         input_dim=INPUT_DIM,
         hidden_dim=HIDDEN_DIM,
@@ -296,6 +277,7 @@ def main():
         seq_len=SEQ_LEN,
     ).to(DEVICE)
 
+    # initialize the Adam optimizer with the model parameters and the specified learning rate (LR).
     optimizer = torch.optim.Adam(model.parameters(), lr=LR)
 
     start_epoch = 1
@@ -311,6 +293,7 @@ def main():
         "beta": [],
     }
 
+    # if RESUME is True and the specified checkpoint file exists, load the model state, optimizer state, epoch number, training history, and best validation loss from the checkpoint to resume training from where it left off. Otherwise, start fresh training from epoch 1.
     if RESUME and RESUME_PATH.exists():
         checkpoint = torch.load(
             RESUME_PATH,
@@ -335,6 +318,8 @@ def main():
         print(f"\nEpoch {epoch}/{TOTAL_EPOCHS}")
         print(f"Beta: {beta:.4f}")
 
+        # train the model for one epoch on the training set and compute the average total loss, reconstruction loss, and KL loss for the epoch. 
+        # The train_one_epoch function runs in training mode (model.train()) and computes gradients to update the model parameters.
         train_total, train_recon, train_kl = train_one_epoch(
             model,
             train_loader,
@@ -343,6 +328,7 @@ def main():
             beta,
         )
 
+        # validate the model on the validation set and compute the average total loss, reconstruction loss, and KL loss for the epoch.
         val_total, val_recon, val_kl = validate(
             model,
             val_loader,
