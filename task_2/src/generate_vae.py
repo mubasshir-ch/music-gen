@@ -6,10 +6,13 @@ import torch
 
 from vae_model import LSTMVAE
 
+# This file loads a trained LSTM VAE model from a checkpoint, generates new piano roll samples by sampling from the latent space, applies a threshold to convert the output probabilities into binary piano rolls, and saves the generated piano rolls as MIDI files.
+# The main steps are: 1) load the model, 2) sample from the latent space, 3) decode to get output probabilities, 4) apply threshold and cap to get binary piano rolls, and 5) convert the binary piano rolls to MIDI files and save them.
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
-CHECKPOINT_PATH = PROJECT_ROOT / "outputs" / "checkpoints" / "best_lstm_vae.pt"
+# CHECKPOINT_PATH = PROJECT_ROOT / "outputs" / "checkpoints" / "best_lstm_vae.pt"
+CHECKPOINT_PATH = PROJECT_ROOT / "outputs" / "checkpoints" / "latest_lstm_vae.pt"
 GENERATED_DIR = PROJECT_ROOT / "outputs" / "generated_vae"
 GENERATED_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -19,17 +22,18 @@ FS = 16
 SEQ_LEN = 128
 
 INPUT_DIM = 88
-HIDDEN_DIM = 128
+HIDDEN_DIM = 128        # reduced hidden dimension for faster generation
 LATENT_DIM = 64
 NUM_LAYERS = 2
 
-NUM_SAMPLES = 8
-THRESHOLD = 0.3
-MAX_NOTES_PER_FRAME = 6
-VELOCITY = 80
+NUM_SAMPLES = 8         # number of piano roll samples to generate from the VAE.
+THRESHOLD = 0.5         # threshold for converting the output probabilities into binary piano rolls. Anything > threshold is considered active (1), and anything <= threshold is considered inactive (0).
+MAX_NOTES_PER_FRAME = 6 # maximum number of active notes allowed per time frame. If the model outputs more than this number of active notes for a frame, we will keep only the top max_notes based on their probabilities and set the rest to inactive (0).
+VELOCITY = 80           # velocity for the generated MIDI notes (0-127). This is a fixed value for all generated notes, but it could be randomized or made dynamic based on the model's output if desired.
 MIN_NOTE_DURATION = 1.0 / FS
 
 
+# Hepler function: Applies a threshold to the probability piano roll and caps the number of active notes per frame to max_notes.
 def apply_threshold_and_cap(prob_roll, threshold, max_notes):
     binary = np.zeros_like(prob_roll, dtype=np.int32)
 
@@ -44,7 +48,8 @@ def apply_threshold_and_cap(prob_roll, threshold, max_notes):
 
     return binary
 
-
+# Converts a binary piano roll into a MIDI file and saves it to the specified output path. 
+# It iterates through each time frame of the piano roll, keeps track of active notes, and creates MIDI note events when notes start and end.
 def pianoroll_to_midi(binary_roll, output_path):
     midi = pretty_midi.PrettyMIDI()
     piano = pretty_midi.Instrument(program=0)
@@ -102,7 +107,9 @@ def pianoroll_to_midi(binary_roll, output_path):
 
     return len(piano.notes)
 
-
+# Loads the trained VAE model from the checkpoint file, 
+# reconstructs the model architecture based on the saved configuration, 
+# and loads the model weights. The model is set to evaluation mode and returned along with its configuration.
 def load_model():
     checkpoint = torch.load(
         CHECKPOINT_PATH,
@@ -131,16 +138,16 @@ def main():
     print("Loading:", CHECKPOINT_PATH)
 
     model, config = load_model()
-    latent_dim = config.get("latent_dim", LATENT_DIM)
+    latent_dim = config.get("latent_dim", LATENT_DIM)       # get the latent dimension from the checkpoint config, or use the default if not available
 
     with torch.no_grad():
         for i in range(NUM_SAMPLES):
-            z = torch.randn(1, latent_dim).to(DEVICE)
+            z = torch.randn(1, latent_dim).to(DEVICE)       # sample a random latent vector z from a standard normal distribution of shape (1, latent_dim)
 
-            logits = model.decode(z)
-            probs = torch.sigmoid(logits)
+            logits = model.decode(z)                        # decode the random latent vector to get output logits of shape (1, seq_len, input_dim)
+            probs = torch.sigmoid(logits)                   # apply sigmoid to convert logits to probabilities in the range [0, 1]
 
-            prob_roll = probs[0].cpu().numpy()
+            prob_roll = probs[0].cpu().numpy()              # convert the output probabilities to a numpy array of shape (seq_len, input_dim) for post-processing
 
             binary_roll = apply_threshold_and_cap(
                 prob_roll,
@@ -150,7 +157,7 @@ def main():
 
             output_path = GENERATED_DIR / f"vae_sample_{i + 1}.mid"
 
-            note_count = pianoroll_to_midi(binary_roll, output_path)
+            note_count = pianoroll_to_midi(binary_roll, output_path)    # convert the binary piano roll to a MIDI file and save it to the output path. The function returns the number of notes in the generated MIDI file.
 
             print(f"Saved: {output_path}")
             print(f"  notes: {note_count}")
